@@ -1,12 +1,19 @@
 # OpenGL Display Pipeline: CPU vs GPU
 
-This project demonstrates two ways to get pixel data onto a screen using OpenGL, and benchmarks them against each other:
+This project demonstrates two ways to get pixel data onto a screen using OpenGL, and benchmarks them against the standard `cv2.imshow` path.
 
-1. **CPU pipeline** (`main.c`) — generate pixels on the CPU, upload them to the GPU, display
-2. **GPU pipeline** (`main_cuda.cu`) — generate pixels on the GPU, copy directly to an OpenGL texture without ever touching the CPU
-3. **Benchmark** (`bench.cu`) — same binary runs either pipeline with detailed per-stage timing
+### Files
 
-Both render an animated plasma pattern. The pattern itself doesn't matter — it's a stand-in for any image source (neural network output, video frame, simulation, etc.).
+| File | Language | What it does |
+|------|----------|-------------|
+| `main.c` | C | CPU pipeline — generate pixels on CPU, upload to GPU via `glTexSubImage2D`, display |
+| `main_cuda.cu` | CUDA/C | GPU pipeline — generate pixels with CUDA kernel, copy to GL texture via `cudaMemcpy2DToArray`, display. Data never leaves VRAM. |
+| `bench.cu` | CUDA/C | Benchmark binary — runs either CPU or GPU pipeline (`./bench cpu` or `./bench gpu`) with per-stage `cudaEvent` timing |
+| `gl_display.cu` | CUDA/C | Shared library (`libgl_display.so`) — exposes a C API (`init`, `show_frame`, `cleanup`) so Python can display a CUDA tensor via CUDA-GL interop without touching the CPU |
+| `bench_cv2.py` | Python | Benchmark — generates image on GPU with PyTorch, displays via `tensor.cpu().numpy()` + `cv2.imshow` |
+| `bench_gl.py` | Python | Benchmark — generates image on GPU with PyTorch, displays via `tensor.data_ptr()` + `libgl_display.so` (CUDA-GL interop) |
+
+All demos/benchmarks render an animated plasma pattern. The pattern itself doesn't matter — it's a stand-in for any image source (neural network output, video frame, simulation, etc.).
 
 ## Prerequisites
 
@@ -29,10 +36,17 @@ python3 -m glad --generator c --out-path glad --api gl=3.3 --profile core
 ## Build
 
 ```bash
-make          # builds all three: demo, demo_cuda, bench
-make demo     # CPU-only version
-make demo_cuda # GPU version
-make bench    # benchmark (supports both modes)
+make                  # builds everything: demo, demo_cuda, bench, libgl_display.so
+make demo             # CPU-only demo
+make demo_cuda        # GPU demo (CUDA-GL interop)
+make bench            # C benchmark (supports cpu/gpu modes)
+make libgl_display.so # shared library for Python benchmarks
+```
+
+For the Python benchmarks:
+```bash
+python3 -m venv .venv
+.venv/bin/pip install torch opencv-python
 ```
 
 ## Run
@@ -45,17 +59,21 @@ ls /tmp/.X11-unix/   # shows X0, X1, etc.
 Then prefix every command with `DISPLAY=:1` (or whichever number).
 
 ```bash
-# CPU demo
+# CPU demo — generate on CPU, upload to GPU, display
 DISPLAY=:1 ./demo
 
-# GPU demo (CUDA → OpenGL interop)
+# GPU demo — generate on GPU, CUDA-GL interop, display
 DISPLAY=:1 ./demo_cuda
 
-# Benchmark — CPU pipeline
+# C benchmark — CPU or GPU pipeline
 DISPLAY=:1 ./bench cpu
-
-# Benchmark — GPU pipeline
 DISPLAY=:1 ./bench gpu
+
+# Python benchmark — PyTorch + cv2.imshow
+DISPLAY=:1 .venv/bin/python bench_cv2.py
+
+# Python benchmark — PyTorch + CUDA-GL interop
+DISPLAY=:1 .venv/bin/python bench_gl.py
 ```
 
 Press **ESC** to close the window.
@@ -317,6 +335,56 @@ Now OpenGL owns the texture again and can draw it.
 
 ---
 
+## Python display library (`gl_display.cu` → `libgl_display.so`)
+
+This is the bridge that lets Python/PyTorch use CUDA-GL interop. It compiles to a shared library with a simple C API, called from Python via `ctypes`.
+
+### API
+
+```c
+int  gl_display_init(int width, int height);        // create window + GL context + CUDA interop
+int  gl_display_show_frame(unsigned long long ptr);  // display a CUDA tensor (pass tensor.data_ptr())
+int  gl_display_should_close(void);                  // check if window was closed
+void gl_display_cleanup(void);                       // tear down everything
+```
+
+### How `show_frame` works
+
+The function takes a raw CUDA device pointer (the `unsigned long long` from `tensor.data_ptr()`) and does the same map/copy/unmap/draw cycle as `main_cuda.cu`:
+
+```c
+int gl_display_show_frame(unsigned long long data_ptr) {
+    // 1. Map GL texture for CUDA access
+    cudaGraphicsMapResources(1, &cuda_tex_resource, 0);
+    cudaGraphicsSubResourceGetMappedArray(&cu_array, cuda_tex_resource, 0, 0);
+
+    // 2. Copy tensor data → GL texture (GPU → GPU, no PCIe)
+    cudaMemcpy2DToArray(cu_array, 0, 0,
+        (void *)data_ptr, width * 4,
+        width * 4, height,
+        cudaMemcpyDeviceToDevice);
+
+    // 3. Unmap, draw, swap
+    cudaGraphicsUnmapResources(1, &cuda_tex_resource, 0);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glfwSwapBuffers(win);
+}
+```
+
+The tensor must be RGBA `uint8`, shape `(H, W, 4)`, contiguous, on CUDA. In Python:
+
+```python
+import ctypes
+lib = ctypes.CDLL("./libgl_display.so")
+lib.gl_display_init(1920, 1080)
+
+# After model inference:
+img = model(input)  # returns (H, W, 4) uint8 CUDA tensor
+lib.gl_display_show_frame(img.data_ptr())
+```
+
+---
+
 ## Benchmark (`bench.cu`)
 
 A single binary that runs either pipeline, controlled by a command-line argument. Uses `cudaEvent` timing to measure each stage with GPU-clock precision.
@@ -350,6 +418,17 @@ Vsync is disabled (`glfwSwapInterval(0)`) so the benchmark measures raw throughp
 
 ---
 
+## Benchmark Results
+
+See [analysis.md](analysis.md) for raw runs and detailed breakdown. Summary at 1920x1080:
+
+| Method | Generate (ms) | Download (ms) | Upload/Display (ms) | Total (ms) | FPS |
+|--------|:---:|:---:|:---:|:---:|:---:|
+| **CPU compute → `glTexSubImage2D`** | 95.62 | — | 2.75 | 98.37 | 10 |
+| **CUDA kernel → CUDA-GL interop** | 0.07 | — | 0.06 | 0.12 | 7530 |
+| **PyTorch → `tensor.cpu()` → `cv2.imshow`** | 2.20 | 2.35 | 13.20 | 17.75 | 56 |
+| **PyTorch → `data_ptr()` → CUDA-GL interop** | 2.09 | — | 0.20 | 2.29 | 440 |
+
 ## Test System
 
 | Component | Spec |
@@ -361,105 +440,3 @@ Vsync is disabled (`glfwSwapInterval(0)`) so the benchmark measures raw throughp
 | **CUDA** | Toolkit 10.1 (driver supports up to 12.2) |
 | **OS** | Linux 5.15.0-139-generic |
 
-## Benchmark Results
-
-Vsync off. 60-frame warmup, averages reported every 60 frames.
-
-### 800x600 (1.92 MB RGBA per frame)
-
-**CPU pipeline:**
-```
-frame       generate      upload      render       total       FPS
-                (ms)        (ms)        (ms)        (ms)
----------------------------------------------------------------
-120           22.188       0.231       0.625      23.044        43
-180           22.138       0.230       0.628      22.996        43
-240           22.171       0.225       0.632      23.029        43
-300           22.114       0.229       0.626      22.969        44
-```
-
-**GPU pipeline:**
-```
-frame       generate      upload      render       total       FPS
-                (ms)        (ms)        (ms)        (ms)
----------------------------------------------------------------
-120            0.020       0.133       0.190       0.344      2910
-180            0.020       0.119       0.152       0.290      3447
-240            0.020       0.171       0.229       0.419      2385
-300            0.020       0.130       0.174       0.324      3082
-360            0.016       0.044       0.057       0.118      8505
-```
-
-| Stage | CPU | GPU | Speedup |
-|-------|-----|-----|---------|
-| **Generate** | 22.15 ms | 0.02 ms | ~1100x |
-| **Upload** | 0.23 ms | 0.13 ms | ~1.8x |
-| **Render** | 0.63 ms | 0.17 ms | ~3.7x |
-| **Total** | 23.01 ms | 0.32 ms | ~72x |
-
-### 1920x1080 (8.29 MB RGBA per frame)
-
-**CPU pipeline:**
-```
-frame       generate      upload      render       total       FPS
-                (ms)        (ms)        (ms)        (ms)
----------------------------------------------------------------
-120           95.617       2.715       0.034      98.366        10
-```
-
-**GPU pipeline:**
-```
-frame       generate      upload      render       total       FPS
-                (ms)        (ms)        (ms)        (ms)
----------------------------------------------------------------
-120            0.068       0.052       0.012       0.133      7530
-180            0.068       0.045       0.001       0.115      8693
-```
-
-| Stage | CPU | GPU | Speedup |
-|-------|-----|-----|---------|
-| **Generate** | 95.62 ms | 0.07 ms | ~1366x |
-| **Upload** | 2.72 ms | 0.05 ms | ~54x |
-| **Render** | 0.03 ms | 0.01 ms | ~3x |
-| **Total** | 98.37 ms | 0.12 ms | ~820x |
-
-### 1920x1080 — PyTorch + cv2.imshow (`bench_cv2.py`)
-
-This measures the realistic Python workflow: generate on GPU with PyTorch, then `tensor.cpu().numpy()` + `cv2.imshow`.
-
-```
-frame       generate    download     display       total       FPS
-                (ms)        (ms)        (ms)        (ms)
-----------------------------------------------------------------------
-120            2.166       2.068      13.513      17.747        56
-180            2.178       2.167      13.817      18.162        55
-240            2.218       2.239      13.909      18.366        54
-300            2.191       2.254      13.567      18.011        56
-360            2.170       2.427      13.007      17.605        57
-420            2.144       2.376      11.772      16.292        61
-480            2.158       2.052      12.812      17.022        59
-540            2.168       1.742      12.575      16.485        61
-600            2.181       2.276      13.321      17.777        56
-660            2.135       2.509      11.921      16.566        60
-720            2.152       2.177      13.137      17.466        57
-```
-
-- **generate** = PyTorch tensor ops on GPU (stand-in for model inference)
-- **download** = `tensor.cpu()` — GPU→CPU over PCIe
-- **display** = `cv2.imshow` + `cv2.waitKey(1)` — includes format conversion, GTK event loop, compositor texture upload
-
-### Analysis
-
-The C benchmark (`bench.cu`) only measured `glTexSubImage2D` for the CPU→GPU upload (2.72ms). The real `tensor.cpu()` + `cv2.imshow` path is far more expensive:
-
-| Stage | cv2.imshow path | CUDA-GL interop |
-|-------|----------------|-----------------|
-| **Download** (GPU→CPU) | 2.2ms | N/A (stays on GPU) |
-| **Upload/Display** | 13.2ms (`cv2.imshow`) | 0.05ms (VRAM→VRAM copy) + 0.01ms (GL draw) |
-| **Total display overhead** | **~15.4ms** | **~0.06ms** |
-
-`cv2.imshow` is not just a PCIe upload — it goes through OpenCV's HighGUI → GTK → X11 → compositor, adding ~10ms of overhead on top of the data transfer.
-
-Against a 33ms budget (30 FPS target):
-- **cv2.imshow** eats **15.4ms** — that's **47%** of your frame budget gone before your model even runs. You only have ~17ms left for inference.
-- **CUDA-GL interop** eats **0.06ms** — effectively free. The full 33ms is available for inference.
