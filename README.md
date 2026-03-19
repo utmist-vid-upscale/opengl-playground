@@ -363,9 +363,11 @@ Vsync is disabled (`glfwSwapInterval(0)`) so the benchmark measures raw throughp
 
 ## Benchmark Results
 
-800x600 resolution, vsync off.
+Vsync off. 60-frame warmup, averages reported every 60 frames.
 
-### CPU pipeline (`./bench cpu`)
+### 800x600 (1.92 MB RGBA per frame)
+
+**CPU pipeline:**
 ```
 frame       generate      upload      render       total       FPS
                 (ms)        (ms)        (ms)        (ms)
@@ -376,7 +378,7 @@ frame       generate      upload      render       total       FPS
 300           22.114       0.229       0.626      22.969        44
 ```
 
-### GPU pipeline (`./bench gpu`)
+**GPU pipeline:**
 ```
 frame       generate      upload      render       total       FPS
                 (ms)        (ms)        (ms)        (ms)
@@ -388,31 +390,50 @@ frame       generate      upload      render       total       FPS
 360            0.016       0.044       0.057       0.118      8505
 ```
 
-### Analysis
-
-| Stage | CPU pipeline | GPU pipeline | Speedup |
-|-------|-------------|-------------|---------|
+| Stage | CPU | GPU | Speedup |
+|-------|-----|-----|---------|
 | **Generate** | 22.15 ms | 0.02 ms | ~1100x |
 | **Upload** | 0.23 ms | 0.13 ms | ~1.8x |
 | **Render** | 0.63 ms | 0.17 ms | ~3.7x |
 | **Total** | 23.01 ms | 0.32 ms | ~72x |
 
-- **Generate** is the dominant cost in the CPU pipeline. A single CPU core computes sinf for 480,000 pixels sequentially. The GPU does the same work across thousands of cores in 20 microseconds — a 1100x improvement.
-- **Upload** shows the PCIe transfer cost. CPU mode sends 1.92 MB over PCIe (~0.23ms). GPU mode does a VRAM-internal copy (~0.13ms). The difference (~0.1ms) is the PCIe overhead.
-- **Render** is faster in GPU mode because the GPU isn't switching between "receive PCIe transfer" and "render" — it can pipeline the work more efficiently.
+### 1920x1080 (8.29 MB RGBA per frame)
 
-### Why this matters for neural networks
+**CPU pipeline:**
+```
+frame       generate      upload      render       total       FPS
+                (ms)        (ms)        (ms)        (ms)
+---------------------------------------------------------------
+120           95.617       2.715       0.034      98.366        10
+```
 
-In a real ML application, the "generate" time would be your model's inference time (likely 5–50ms). The question is whether you then:
-- Copy the result to CPU and upload it (`tensor.cpu().numpy()` + `glTexSubImage2D`) — adding PCIe round-trip overhead
-- Or keep it on the GPU and copy directly to the GL texture — avoiding the CPU entirely
+**GPU pipeline:**
+```
+frame       generate      upload      render       total       FPS
+                (ms)        (ms)        (ms)        (ms)
+---------------------------------------------------------------
+120            0.068       0.052       0.012       0.133      7530
+180            0.068       0.045       0.001       0.115      8693
+```
 
-At higher resolutions, the PCIe overhead grows linearly:
+| Stage | CPU | GPU | Speedup |
+|-------|-----|-----|---------|
+| **Generate** | 95.62 ms | 0.07 ms | ~1366x |
+| **Upload** | 2.72 ms | 0.05 ms | ~54x |
+| **Render** | 0.03 ms | 0.01 ms | ~3x |
+| **Total** | 98.37 ms | 0.12 ms | ~820x |
 
-| Resolution | RGBA size | Estimated PCIe transfer |
-|-----------|----------|------------------------|
-| 800x600 | 1.9 MB | ~0.1 ms |
-| 1920x1080 | 8.3 MB | ~0.5 ms |
-| 3840x2160 | 33 MB | ~2 ms |
+### Analysis
 
-At 4K targeting 60 FPS (16ms budget), a 2ms PCIe round trip is 12.5% of your frame budget wasted on data movement.
+**Generate** is irrelevant to a real ML use case — your model runs on GPU regardless. The plasma kernel is just a stand-in.
+
+**Upload is the metric that matters.** At 1080p:
+- CPU path: **2.72ms** — `glTexSubImage2D` sends 8.3 MB over the PCIe bus
+- GPU path: **0.05ms** — `cudaMemcpy2DToArray` copies within VRAM
+
+That's a **2.67ms difference** per frame. Against a 33ms budget (30 FPS target), the CPU path spends **8%** of your frame time just moving data. The GPU path spends **0.15%**.
+
+Whether this matters depends on your model's inference time:
+- Model takes 15ms → 33 - 15 = 18ms headroom. 2.7ms is fine, use the simpler CPU path.
+- Model takes 28ms → 33 - 28 = 5ms headroom. 2.7ms eats over half your remaining budget. Use GPU path.
+- Model takes 32ms → you're already borderline. 2.7ms pushes you past the deadline. GPU path is mandatory.

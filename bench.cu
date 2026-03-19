@@ -14,8 +14,8 @@
 #include <string.h>
 #include <math.h>
 
-#define WIDTH  800
-#define HEIGHT 600
+#define WIDTH  1920
+#define HEIGHT 1080
 #define WARMUP_FRAMES 60
 #define REPORT_INTERVAL 60  // print averages every N frames
 
