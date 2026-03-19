@@ -423,17 +423,43 @@ frame       generate      upload      render       total       FPS
 | **Render** | 0.03 ms | 0.01 ms | ~3x |
 | **Total** | 98.37 ms | 0.12 ms | ~820x |
 
+### 1920x1080 — PyTorch + cv2.imshow (`bench_cv2.py`)
+
+This measures the realistic Python workflow: generate on GPU with PyTorch, then `tensor.cpu().numpy()` + `cv2.imshow`.
+
+```
+frame       generate    download     display       total       FPS
+                (ms)        (ms)        (ms)        (ms)
+----------------------------------------------------------------------
+120            2.166       2.068      13.513      17.747        56
+180            2.178       2.167      13.817      18.162        55
+240            2.218       2.239      13.909      18.366        54
+300            2.191       2.254      13.567      18.011        56
+360            2.170       2.427      13.007      17.605        57
+420            2.144       2.376      11.772      16.292        61
+480            2.158       2.052      12.812      17.022        59
+540            2.168       1.742      12.575      16.485        61
+600            2.181       2.276      13.321      17.777        56
+660            2.135       2.509      11.921      16.566        60
+720            2.152       2.177      13.137      17.466        57
+```
+
+- **generate** = PyTorch tensor ops on GPU (stand-in for model inference)
+- **download** = `tensor.cpu()` — GPU→CPU over PCIe
+- **display** = `cv2.imshow` + `cv2.waitKey(1)` — includes format conversion, GTK event loop, compositor texture upload
+
 ### Analysis
 
-**Generate** is irrelevant to a real ML use case — your model runs on GPU regardless. The plasma kernel is just a stand-in.
+The C benchmark (`bench.cu`) only measured `glTexSubImage2D` for the CPU→GPU upload (2.72ms). The real `tensor.cpu()` + `cv2.imshow` path is far more expensive:
 
-**Upload is the metric that matters.** At 1080p:
-- CPU path: **2.72ms** — `glTexSubImage2D` sends 8.3 MB over the PCIe bus
-- GPU path: **0.05ms** — `cudaMemcpy2DToArray` copies within VRAM
+| Stage | cv2.imshow path | CUDA-GL interop |
+|-------|----------------|-----------------|
+| **Download** (GPU→CPU) | 2.2ms | N/A (stays on GPU) |
+| **Upload/Display** | 13.2ms (`cv2.imshow`) | 0.05ms (VRAM→VRAM copy) + 0.01ms (GL draw) |
+| **Total display overhead** | **~15.4ms** | **~0.06ms** |
 
-That's a **2.67ms difference** per frame. Against a 33ms budget (30 FPS target), the CPU path spends **8%** of your frame time just moving data. The GPU path spends **0.15%**.
+`cv2.imshow` is not just a PCIe upload — it goes through OpenCV's HighGUI → GTK → X11 → compositor, adding ~10ms of overhead on top of the data transfer.
 
-Whether this matters depends on your model's inference time:
-- Model takes 15ms → 33 - 15 = 18ms headroom. 2.7ms is fine, use the simpler CPU path.
-- Model takes 28ms → 33 - 28 = 5ms headroom. 2.7ms eats over half your remaining budget. Use GPU path.
-- Model takes 32ms → you're already borderline. 2.7ms pushes you past the deadline. GPU path is mandatory.
+Against a 33ms budget (30 FPS target):
+- **cv2.imshow** eats **15.4ms** — that's **47%** of your frame budget gone before your model even runs. You only have ~17ms left for inference.
+- **CUDA-GL interop** eats **0.06ms** — effectively free. The full 33ms is available for inference.
